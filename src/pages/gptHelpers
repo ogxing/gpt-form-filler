@@ -1,0 +1,29 @@
+import openai, { Configuration } from "openai";
+
+const configuration = new Configuration({
+  apiKey: "your_api_key_here",
+});
+const openaiClient = new openai.OpenAIApi(configuration);
+
+export const summarizeWithChatGPT = async (text: string): Promise<string | null> => {
+  try {
+    const response = await openaiClient.createCompletion({
+      engine: "gpt-3.5-turbo", // You can use the 'text-davinci-002' engine for a more powerful summarization
+      prompt: `Please summarize the following text and extract key information and relations in as little tokens as possible:\n\n${text}`,
+      temperature: 0.7,
+      max_tokens: 50, // Limit the summary to a certain number of tokens
+      top_p: 1,
+      frequency_penalty: 0,
+      presence_penalty: 0,
+    });
+
+    if (response.choices && response.choices.length > 0) {
+      return response.choices[0].text.trim();
+    } else {
+      return null;
+    }
+  } catch (error) {
+    console.error("Error calling ChatGPT API:", error);
+    return null;
+  }
+};
