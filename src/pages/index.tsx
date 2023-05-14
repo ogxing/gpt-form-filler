@@ -28,12 +28,12 @@ const Home: React.FC = () => {
       </svg>
       <h1 className="text-4xl font-semibold text-center text-black w-full mb-12">Justice Bao 包拯</h1>
       <div className="flex flex-wrap justify-center gap-8">
-        <PDFUploader onUpload={handleUpload} onExtract={handleExtract} />
-        <TemplateUploader onUpload={handleUpload} /> {/* Use the TemplateUploader component */}
+        <PDFUploader onExtract={handleExtract} />
+        <TemplateUploader onUpload={handleUpload} />{/* Use the TemplateUploader component */}
       </div>
       <button
         className="mt-8 px-6 py-3 bg-blue-500 text-white font-semibold rounded"
-        //onClick={processFiles}
+      //onClick={processFiles}
       >
         Process Files
       </button>
