@@ -1,5 +1,6 @@
 import { ImageAnnotatorClient } from '@google-cloud/vision';
 import { Storage } from '@google-cloud/storage';
+import { DocumentProcessorServiceClient } from '@google-cloud/documentai';
 import { z } from 'zod';
 import { ChatOpenAI } from 'langchain/chat_models/openai';
 import { createExtractionChainFromZod } from 'langchain/chains';
@@ -10,214 +11,382 @@ import { InMemoryStore } from 'langchain/storage/in_memory';
 import { FaissStore } from 'langchain/vectorstores/faiss';
 import { Document } from 'langchain/document';
 import { JSONLoader } from 'langchain/document_loaders/fs/json';
+import { format } from 'date-fns';
 import fs from 'fs';
 import path, { dirname } from 'path';
 import { fileURLToPath } from 'url';
 
+// Replace with your own API key.
 const OPENAI_API_KEY = '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';
 
+// Replace with your own google cloud project id, process location and processor id.
+const projectId = '1059943768755';
+const location = 'us';
+const essayProcessorId = 'b23160dc2f2e52b3';
+const formProcessorId = 'b6fc1624054856a2';
+
+const essayFolderName = 'essays';
+const formFolderName = 'forms';
+const templateFolderName = 'templates';
+const rawOcrOutputFolderName = 'ocr';
+const langchainInputFolderName = 'slim';
+const langchainIndividualOutputFileName = 'langchain-each.json';
+const langchainMergedOutputFileName = 'langchain.json';
+
+const uid = '20230907_021234'; // generateHumanReadableDate(Date.now());
 const rootPath = path.join(fileURLToPath(dirname(import.meta.url)), '..');
-const uid = Date.now().toString();
+const inputPath = path.join(rootPath, 'source');
+const outputPath = path.join(rootPath, 'output', uid);
+
+// Make sure service account json file is present at root directory to authenticate with google cloud.
+const serviceAccountJsonPath = path.join(rootPath, 'service-account.json');
+
+// Create a new output directory for this run.
+fs.mkdirSync(outputPath, { recursive: true });
+
+function copyFolderSync(source: string, target: string) {
+  if (!fs.existsSync(target)) {
+    fs.mkdirSync(target, { recursive: true });
+  }
+
+  const files = fs.readdirSync(source);
+
+  files.forEach((file) => {
+    const sourcePath = `${source}/${file}`;
+    const targetPath = `${target}/${file}`;
+
+    if (fs.statSync(sourcePath).isDirectory()) {
+      copyFolderSync(sourcePath, targetPath);
+    } else {
+      fs.copyFileSync(sourcePath, targetPath);
+    }
+  });
+}
+
+function generateHumanReadableDate(milliseconds: number) {
+  const date = new Date(milliseconds);
+  const dateFormat = 'yyyyMMdd_HHmmss';
+
+  return format(date, dateFormat);
+}
 
 /**
- * Support image and pdf files.
- * Upload pdf files to GCS then start OCR and save the OCR result at local data directory.
+ * Backup all source data to output directory.
  */
-async function googleOcr(directoryPath: string) {
-  const serviceAccountJsonPath = path.join(rootPath, 'service-account.json');
+async function backupSourceFilesToOutputFolder(sourcePath: string) {
+  copyFolderSync(
+    path.join(sourcePath, essayFolderName),
+    path.join(outputPath, essayFolderName)
+  );
+  copyFolderSync(
+    path.join(sourcePath, formFolderName),
+    path.join(outputPath, formFolderName)
+  );
+  copyFolderSync(
+    path.join(sourcePath, templateFolderName),
+    path.join(outputPath, templateFolderName)
+  );
+}
 
-  const client = new ImageAnnotatorClient({
+/**
+ * Note: Google document ai batch mode only support files stored in GCS.
+ * Batch mode (current) support up to 200 pages per pdf.
+ * Sync mode (not used, which supports direct upload and doesn't require GCS) support up to 10 pages per pdf.
+ *
+ * Steps:
+ * - Upload all source files to GCS.
+ * - Request OCR for all uploaded files.
+ * - Download OCR result files from GCS to local data directory.
+ * - Delete all uploaded and result files from GCS.
+ */
+async function googleOcr(sourcePath: string) {
+  const storage = new Storage({ keyFilename: serviceAccountJsonPath });
+  const document = new DocumentProcessorServiceClient({
     keyFilename: serviceAccountJsonPath,
   });
-  const storage = new Storage({ keyFilename: serviceAccountJsonPath });
 
   // Get all source data files from local directory.
-  const sourceFiles = fs.readdirSync(directoryPath);
+  const essayFileNames = fs.readdirSync(path.join(sourcePath, essayFolderName));
+  const formFileNames = fs.readdirSync(path.join(sourcePath, formFolderName));
 
+  // Upload all source files to GCS.
   const bucketName = 'vision-ocr-source';
-  const filePrefix = `${bucketName}/${uid}`;
+  const gcsInputPrefix = 'input';
+  const gcsOutputPrefix = 'output';
 
-  const ocrOutputPath = path.join(rootPath, 'data', uid, 'ocr');
-  fs.mkdirSync(ocrOutputPath, { recursive: true });
+  async function upload(fileName: string, prefix: string) {
+    const sourceFilePath = path.join(sourcePath, prefix, fileName);
+    const destination = `${uid}/${gcsInputPrefix}/${prefix}/${fileName}`;
 
+    await storage.bucket(bucketName).upload(sourceFilePath, {
+      destination,
+    });
+
+    console.log(`File uploaded to ${destination}`);
+  }
+
+  console.log('Uploading to GCS');
   await Promise.all(
-    sourceFiles.map(async (fileName) => {
-      if (fileName.toLowerCase().endsWith('.pdf')) {
-        // Currently all PDF files must be uploaded to Google Cloud Storage before they can be processed.
-        // https://cloud.google.com/vision/docs/pdf#document_text_detection_requests
-        // Excerpt: Currently PDF/TIFF document detection is only available for files stored in Cloud Storage buckets. Response JSON files are similarly saved to a Cloud Storage bucket.
-        const gcsSourceUri = `gs://${filePrefix}/input/${fileName}`;
-
-        // Upload file to GCS.
-        await storage
-          .bucket(bucketName)
-          .upload(path.join(directoryPath, fileName), {
-            destination: `${uid}/input/${fileName}`,
-          });
-        console.log(`File uploaded to ${gcsSourceUri}`);
-
-        // Start OCR.
-        const [operation] = await client.asyncBatchAnnotateFiles({
-          requests: [
-            {
-              inputConfig: {
-                mimeType: 'application/pdf',
-                gcsSource: {
-                  uri: gcsSourceUri,
-                },
-              },
-              features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
-              outputConfig: {
-                gcsDestination: {
-                  uri: `gs://${filePrefix}/output/${removeFileExtension(
-                    fileName
-                  )}`,
-                },
-              },
-            },
-          ],
-        });
-        const [filesResponse] = await operation.promise();
-      } else {
-        // Image can be OCR-ed directly without uploading to GCS.
-        const [result] = await client.textDetection(
-          path.join(directoryPath, fileName)
-        );
-        fs.writeFileSync(
-          path.join(ocrOutputPath, `${removeFileExtension(fileName)}.json`),
-          JSON.stringify(result)
-        );
-      }
-    })
+    [
+      essayFileNames.map((fileName) => upload(fileName, essayFolderName)),
+      formFileNames.map((fileName) => upload(fileName, formFolderName)),
+    ].flat()
   );
 
+  // Initiate ocr for all files.
+  function process(
+    fileNames: string[],
+    type: 'essay' | 'form',
+    prefix: string
+  ) {
+    if (fileNames.length === 0) {
+      return;
+    }
+
+    return document.batchProcessDocuments({
+      name: `projects/${projectId}/locations/${location}/processors/${
+        type === 'essay' ? essayProcessorId : formProcessorId
+      }`,
+      inputDocuments: {
+        gcsDocuments: {
+          documents: fileNames.map((fileName) => {
+            return {
+              gcsUri: `gs://${bucketName}/${uid}/${gcsInputPrefix}/${prefix}/${fileName}`,
+              mimeType: fileName.toLowerCase().endsWith('pdf')
+                ? 'application/pdf'
+                : 'image/tiff',
+            };
+          }),
+        },
+      },
+      documentOutputConfig: {
+        gcsOutputConfig: {
+          gcsUri: `gs://${bucketName}/${uid}/${gcsOutputPrefix}/${prefix}`,
+        },
+      },
+    });
+  }
+
+  console.log('Initiating ocr');
+  const [essayOperations, formOperations] = await Promise.all([
+    process(essayFileNames, 'essay', essayFolderName),
+    process(formFileNames, 'form', formFolderName),
+  ]);
+
+  console.log('Waiting for ocr to complete');
+  await Promise.all([
+    essayOperations ? essayOperations[0].promise() : undefined,
+    formOperations ? formOperations[0].promise() : undefined,
+  ]);
+
   // Download all OCR output files from GCS into local data directory.
-  try {
+  async function download(type: 'essay' | 'form', prefix: string) {
+    const ocrOutputPath = path.join(outputPath, rawOcrOutputFolderName, prefix);
+    fs.mkdirSync(ocrOutputPath, { recursive: true });
+
     const [files] = await storage
       .bucket(bucketName)
-      .getFiles({ prefix: `${uid}/output` });
+      .getFiles({ prefix: `${uid}/${gcsOutputPrefix}/${type}` });
 
-    for (const file of files) {
-      const fileName = file.name.split('/').pop();
-      const destination = path.join(ocrOutputPath, `${fileName}`);
+    await Promise.all(
+      files.map(async (file) => {
+        const fileName = file.name.split('/').pop();
+        const destination = path.join(ocrOutputPath, fileName ?? '');
 
-      await file.download({ destination });
+        await file.download({ destination });
 
-      console.log(`Downloaded: ${file.name} to ${destination}}`);
-    }
-  } catch (error) {
-    console.error('Error:', error);
+        console.log(`Downloaded: ${file.name} to ${destination}}`);
+      })
+    );
   }
+
+  await Promise.all([
+    download('essay', essayFolderName),
+    download('form', formFolderName),
+  ]);
 
   // Delete all uploaded and result files from GCS.
   await storage.bucket(bucketName).deleteFiles({ prefix: uid });
-  console.log(`All files deleted successfully at gs://${filePrefix}`);
+  console.log(`All files deleted successfully at gs://${bucketName}/${uid}`);
 }
 
 function removeFileExtension(fileName: string) {
   return fileName.split('.').slice(0, -1).join('.');
 }
 
-function generateSlimOcrResult(directoryPath: string) {
-  const sourceFiles = fs.readdirSync(directoryPath);
+/**
+ * Extract only relevant information from raw OCR output.
+ * Essay will be written out as .txt, and form will be written out as .json.
+ * Read all essay and form ocr result then output them into a single directory to simplify langchain document loading.
+ */
+function generateSlimOcrResult(alwaysTxt = true) {
+  function generate(type: 'essay' | 'form', prefix: string) {
+    const baseInputPath = path.join(outputPath, rawOcrOutputFolderName, prefix);
+    const baseOutputPath = path.join(outputPath, langchainInputFolderName);
 
-  fs.mkdirSync(path.join(directoryPath, '..', 'slim'), { recursive: true });
+    fs.mkdirSync(baseOutputPath, { recursive: true });
 
-  sourceFiles.forEach((fileName) => {
-    const result = JSON.parse(
-      fs.readFileSync(path.join(directoryPath, fileName), 'utf-8')
-    );
+    const sourceFiles = fs.readdirSync(baseInputPath);
 
-    let output: any[] = [];
-
-    // PDF ocr output.
-    if (result.inputConfig) {
-      // Extract text from each pages.
-      result.responses.map((response: any) => {
-        output.push({
-          pageContent: response.fullTextAnnotation.text,
-          metadata: {
-            fileName,
-            page: response.context.pageNumber,
-            type: 'pdf',
-          },
-        });
-      });
-    }
-    // Image ocr output
-    else {
-      output.push({
-        pageContent: result.fullTextAnnotation.text,
-        metadata: {
-          fileName,
-          type: 'image',
-        },
-      });
-    }
-
-    if (output) {
-      fs.writeFileSync(
-        path.join(directoryPath, '..', 'slim', fileName),
-        JSON.stringify(output, null, 2)
+    sourceFiles.forEach((fileName) => {
+      const source = JSON.parse(
+        fs.readFileSync(path.join(baseInputPath, fileName), 'utf-8')
       );
-    }
-  });
+
+      // Essay pull out all texts into .txt
+      if (type === 'essay') {
+        const text = source.text;
+
+        const outputFilePath = path.join(
+          baseOutputPath,
+          removeFileExtension(fileName) + '.txt'
+        );
+        fs.writeFileSync(outputFilePath, text);
+
+        console.log(`Written to ${outputFilePath}`);
+      }
+      // Form pull out recognized entities into json.
+      else {
+        // Convert json into txt for better llm consumption.
+        let txtOutput = '';
+
+        // Result are grouped by pages.
+        const jsonOutput = source.pages.map((page: any, i: number) => {
+          let result = { page: i };
+
+          // Named fields annotated by document ai.
+          if (page.formFields) {
+            page.formFields.forEach((field: any) => {
+              if (field.fieldValue && field.fieldValue.textAnchor) {
+                // @ts-expect-error
+                result[field.fieldName.textAnchor.content.trim()] =
+                  field.fieldValue.textAnchor.content.trim();
+
+                txtOutput += `${field.fieldName.textAnchor.content
+                  .trim()
+                  .replace(/\n/g, '\\n')}: ${field.fieldValue.textAnchor.content
+                  .trim()
+                  .replace(/\n/g, '\\n')}\n`;
+              }
+            });
+          }
+
+          txtOutput += '\n';
+
+          // Each page can contains multiple tables, present them in final result.
+          if (page.tables) {
+            page.tables.forEach((table: any, j: number) => {
+              const allRows: [] = [];
+
+              function process(rows: any[]) {
+                if (!rows) {
+                  return;
+                }
+
+                rows.forEach((headerRow: any) => {
+                  allRows.push(
+                    // @ts-expect-error
+                    headerRow.cells.map((cell: any, k: number) => {
+                      const segment = cell.layout.textAnchor.textSegments;
+
+                      if (segment) {
+                        const sourceText = source.text
+                          .substring(segment[0].startIndex, segment[0].endIndex)
+                          .trim();
+
+                        txtOutput += `${k > 0 ? '|' : ''}${sourceText.replace(
+                          /\n/g,
+                          '\\n'
+                        )}`;
+
+                        return sourceText;
+                      }
+
+                      return '';
+                    })
+                  );
+                  txtOutput += '\n';
+                });
+              }
+
+              txtOutput += '\n';
+              process(table.headerRows);
+              process(table.bodyRows);
+
+              // @ts-expect-error
+              result[`table${j}`] = allRows;
+            });
+          }
+
+          return result;
+        });
+
+        // Note: Disabled for now since it mainly contains duplicate data with field and tables.
+        // General fields that are lumped together by document ai.
+        // if (source.entities) {
+        //   source.entities.forEach((entity: any, i: number) => {
+        //     output[i].misc = entity.properties.map((property: any) => [
+        //       property.type,
+        //       property.mentionText,
+        //     ]);
+        //   });
+        // }
+
+        const outputFilePath = path.join(
+          baseOutputPath,
+          removeFileExtension(fileName) + (alwaysTxt ? '.txt' : '.json')
+        );
+
+        fs.writeFileSync(
+          outputFilePath,
+          alwaysTxt ? txtOutput : JSON.stringify(jsonOutput, null, 2)
+        );
+
+        console.log(`Written to ${outputFilePath}`);
+      }
+    });
+  }
+
+  generate('essay', essayFolderName);
+  generate('form', formFolderName);
 }
 
 /**
+ * Summarize each slimed essay using GPT to reduce file size and potentially increase embedding performance.
+ * Replaces all the essay files with the summarized version that will be used as input for langchain for extraction.
+ */
+async function summarizeAllSlimEssay() {}
+
+/**
+ * Do not use embedding since bank statement etc embedding had a hard time retrieving the correct value.
+ * Ask gpt one document at a time, then merge the result at the end.
+ * One document at a time should be able to fit into gpt3.5 token limit.
  *
  * Adapted from:
  * https://js.langchain.com/docs/modules/chains/popular/structured_output
  * https://gist.github.com/horosin/5351ae4dc3eebbf181f9db212f5d3ebc
  */
-async function extractFieldsFromOcrResult(directoryPath: string) {
-  const sourceFiles = fs.readdirSync(directoryPath);
+async function extractFieldsFromOcrResult() {
+  const basePath = path.join(outputPath, langchainInputFolderName);
+  const inputFiles = fs.readdirSync(basePath);
 
-  // Load all OCR result json files into langchain document.
-  // Assuming each pdf pages doesn't exceed 4096 gpt3.5 token limit, thus no further splitting is required.
-  const docs: Document[] = [];
+  // Assuming each file doesn't exceed 4096 gpt3.5 token limit, thus no further splitting is required.
+  const docs: any[] = [];
 
-  sourceFiles.forEach((fileName) => {
-    const result = JSON.parse(
-      fs.readFileSync(path.join(directoryPath, fileName), 'utf-8')
+  inputFiles.forEach((fileName) => {
+    const content = fs.readFileSync(path.join(basePath, fileName), 'utf-8');
+    docs.push(
+      // If json remove formatting.
+      fileName.endsWith('.txt') ? content : JSON.stringify(JSON.parse(content))
     );
-
-    // PDF ocr output.
-    if (result.inputConfig) {
-      // Extract text from each pages.
-      result.responses.map((response: any) => {
-        docs.push(
-          new Document({
-            pageContent: response.fullTextAnnotation.text,
-            metadata: {
-              fileName,
-              page: response.context.pageNumber,
-              type: 'pdf',
-            },
-          })
-        );
-      });
-    }
-    // Image ocr output
-    else {
-      docs.push(
-        new Document({
-          pageContent: result.fullTextAnnotation.text,
-          metadata: {
-            fileName,
-            type: 'image',
-          },
-        })
-      );
-    }
   });
 
   // Generate embeddings for all documents, use cache whenever possible.
   // https://js.langchain.com/docs/modules/data_connection/text_embedding/how_to/caching_embeddings
-  const underlyingEmbeddings = new OpenAIEmbeddings({
-    openAIApiKey: OPENAI_API_KEY,
-  });
-  const inMemoryStore = new InMemoryStore();
+  // const underlyingEmbeddings = new OpenAIEmbeddings({
+  //   openAIApiKey: OPENAI_API_KEY,
+  // });
+  // const inMemoryStore = new InMemoryStore();
 
   //   const cacheBackedEmbeddings = CacheBackedEmbeddings.fromBytesStore(
   //     underlyingEmbeddings,
@@ -368,30 +537,59 @@ async function extractFieldsFromOcrResult(directoryPath: string) {
   });
 
   const model = new ChatOpenAI({
-    modelName: 'gpt-3.5-turbo',
+    modelName: 'gpt-3.5-turbo-16k',
     temperature: 0,
     openAIApiKey: OPENAI_API_KEY,
     verbose: true,
   });
 
+  const responses: string[] = [];
+
+  // Execute 1 by 1 to avoid hitting openai rate limit.
+  for await (const doc of docs) {
+    const chain = createExtractionChainFromZod(zodSchema, model);
+
+    const response = await chain.run(
+      typeof doc === 'string' ? doc : JSON.stringify(doc)
+    );
+
+    responses.push(response);
+    console.log(JSON.stringify(response, null, 2));
+  }
+
+  // Save all individual GPT result inside a single json.
+  const individualOutputPath = path.join(
+    outputPath,
+    langchainIndividualOutputFileName
+  );
+
+  fs.writeFileSync(individualOutputPath, JSON.stringify(responses, null, 2));
+  console.log(`Langchain output saved to ${individualOutputPath}`);
+
+  // Ask GPT again to merge all individual result into a single json.
   const chain = createExtractionChainFromZod(zodSchema, model);
+  const mergedResponse = await chain.run(JSON.stringify(responses));
 
-  // Feed vector store into model.
-  //   const vectorStoreRetriever = vectorStore.asRetriever();
+  const mergedOutputPath = path.join(outputPath, langchainMergedOutputFileName);
+  fs.writeFileSync(mergedOutputPath, JSON.stringify(mergedResponse, null, 2));
+  console.log(JSON.stringify(mergedResponse, null, 2));
 
-  const response = await chain.run(JSON.stringify(docs));
-
-  const parsedResponse = JSON.stringify(response, null, 2);
-
-  console.log(parsedResponse);
-
-  const outputPath = path.join(directoryPath, '..', 'langchain.json');
-  fs.writeFileSync(outputPath, parsedResponse);
-  console.log(`Langchain output saved to ${outputPath}`);
+  console.log(`Langchain output saved to ${mergedOutputPath}`);
 }
 
-// googleOcr(path.join(rootPath, 'data', 'documents'));
+async function runPythonLlamaLangchain() {}
 
-// extractFieldsFromOcrResult(path.join(rootPath, 'data', '1693744562014', 'ocr'));
+async function fillInTemplate() {}
 
-generateSlimOcrResult(path.join(rootPath, 'data', '1693744562014', 'ocr'));
+async function run(directoryPath: string) {
+  await backupSourceFilesToOutputFolder(directoryPath);
+  await googleOcr(directoryPath);
+  generateSlimOcrResult();
+  await summarizeAllSlimEssay();
+  await extractFieldsFromOcrResult();
+}
+run(inputPath);
+
+// generateSlimOcrResult();
+
+// extractFieldsFromOcrResult();

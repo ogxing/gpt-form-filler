@@ -20,7 +20,7 @@ openai.api_key = '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'
 
 current_script_dir = os.path.dirname(os.path.abspath(__file__))
 root_path = os.path.abspath(os.path.join(current_script_dir, '..'))
-document_directory =os.path.join(root_path, 'data', 'ocr-sample')
+document_directory =os.path.join(root_path, 'output', '20230907_021234', 'slim')
 
 documents = SimpleDirectoryReader(document_directory).load_data()
 llm_predictor = StructuredLLMPredictor()
