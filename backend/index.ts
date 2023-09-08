@@ -17,6 +17,9 @@ import { fileURLToPath } from 'url';
 import * as PizZip from 'pizzip';
 import * as Docxtemplater from 'docxtemplater';
 import { lookup } from 'mime-types';
+import Fastify from 'fastify';
+import cors from '@fastify/cors';
+import fastifyStatic from '@fastify/static';
 
 // Replace with your own API key.
 const OPENAI_API_KEY = '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';
@@ -36,6 +39,8 @@ const langchainInputFolderName = 'slim';
 const langchainIndividualOutputFileName = 'langchain-each.json';
 const langchainMergedOutputFileName = 'langchain.json';
 const defaultSourceDataFolder = 'source';
+
+const serverPort = 8888;
 
 const rootPath = path.join(fileURLToPath(dirname(import.meta.url)), '..');
 
@@ -601,6 +606,8 @@ async function runPythonLlamaLangchain() {}
  * For table, it will be {{[]|field_name1|field_name2|field_name3}}, and each matched
  */
 async function fillInTemplate({ outputPath }: { outputPath: string }) {
+  const filledTemplatePaths: string[] = [];
+
   const langchainOutputPath = path.join(
     outputPath,
     langchainMergedOutputFileName
@@ -655,7 +662,7 @@ async function fillInTemplate({ outputPath }: { outputPath: string }) {
     );
 
     fs.writeFileSync(filledTemplateOutputPath, buf);
-
+    filledTemplatePaths.push(filledTemplateOutputPath);
     console.log(`Filled template saved to ${filledTemplateOutputPath}`);
   }
 
@@ -666,14 +673,19 @@ async function fillInTemplate({ outputPath }: { outputPath: string }) {
   for (const templateFileName of templateFileNames) {
     generateDocx(templateFileName);
   }
+
+  return filledTemplatePaths;
 }
 
 function setupNewRun() {
-  const uid = '20230908_125219'; // generateHumanReadableDate(Date.now());
+  const uid = generateHumanReadableDate(Date.now());
   const outputPath = path.join(rootPath, 'output', uid);
 
   // Create a new output directory for this run.
   fs.mkdirSync(outputPath, { recursive: true });
+  fs.mkdirSync(path.join(outputPath, essayFolderName), { recursive: true });
+  fs.mkdirSync(path.join(outputPath, formFolderName), { recursive: true });
+  fs.mkdirSync(path.join(outputPath, templateFolderName), { recursive: true });
 
   console.log(`New run: ${uid} at ${outputPath}`);
 
@@ -691,4 +703,74 @@ export async function run() {
   generateSlimOcrResult({ outputPath });
   await extractFieldsFromOcrResult({ outputPath });
   await fillInTemplate({ outputPath });
+}
+
+export function startServer() {
+  const fastify = Fastify({ bodyLimit: 1024 * 1024 * 1024 * 1024 });
+  fastify.register(cors);
+  fastify.register(fastifyStatic, { root: path.join(rootPath, 'output') });
+
+  fastify.post('/run', async (req, res) => {
+    const body = req.body as {
+      essay: { name: string; content: string };
+      form: { name: string; content: string };
+      template: { name: string; content: string };
+    };
+
+    const { essay, form, template } = body;
+    const { uid, outputPath } = setupNewRun();
+
+    function saveBase64StringToFile(outputFilePath: string, content: string) {
+      const buffer = Buffer.from(content.split('base64,')[1], 'base64');
+      fs.writeFileSync(outputFilePath, buffer);
+      console.log(`Saved frontend provided file to ${outputFilePath}`);
+    }
+
+    if (!template) {
+      throw new Error('Template is required');
+    }
+
+    if (!essay && !form) {
+      throw new Error('Either essay or form is required');
+    }
+
+    if (essay) {
+      saveBase64StringToFile(
+        path.join(outputPath, essayFolderName, essay.name),
+        essay.content
+      );
+    }
+
+    if (form) {
+      saveBase64StringToFile(
+        path.join(outputPath, formFolderName, form.name),
+        form.content
+      );
+    }
+
+    saveBase64StringToFile(
+      path.join(outputPath, templateFolderName, template.name),
+      template.content
+    );
+
+    await googleOcr({ outputPath, uid });
+    generateSlimOcrResult({ outputPath });
+    await extractFieldsFromOcrResult({ outputPath });
+    const filledTemplatePaths = await fillInTemplate({ outputPath });
+
+    return res.send(
+      filledTemplatePaths.map((templatePath) => {
+        return {
+          name: path.basename(templatePath),
+          url: `http://localhost:${serverPort}/${uid}/${filledTemplateFolderName}/${path.basename(
+            templatePath
+          )}`,
+        };
+      })
+    );
+  });
+
+  fastify
+    .listen({ port: serverPort })
+    .then(() => console.log(`Server listening on port ${serverPort}`));
 }
