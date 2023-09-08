@@ -15,6 +15,9 @@ import { format } from 'date-fns';
 import fs from 'fs';
 import path, { dirname } from 'path';
 import { fileURLToPath } from 'url';
+import * as PizZip from 'pizzip';
+import * as DocxTemplater from 'docxtemplater';
+import { lookup } from 'mime-types';
 
 // Replace with your own API key.
 const OPENAI_API_KEY = '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';
@@ -33,16 +36,10 @@ const langchainInputFolderName = 'slim';
 const langchainIndividualOutputFileName = 'langchain-each.json';
 const langchainMergedOutputFileName = 'langchain.json';
 
-const uid = '20230907_021234'; // generateHumanReadableDate(Date.now());
 const rootPath = path.join(fileURLToPath(dirname(import.meta.url)), '..');
-const inputPath = path.join(rootPath, 'source');
-const outputPath = path.join(rootPath, 'output', uid);
 
 // Make sure service account json file is present at root directory to authenticate with google cloud.
 const serviceAccountJsonPath = path.join(rootPath, 'service-account.json');
-
-// Create a new output directory for this run.
-fs.mkdirSync(outputPath, { recursive: true });
 
 function copyFolderSync(source: string, target: string) {
   if (!fs.existsSync(target)) {
@@ -73,7 +70,13 @@ function generateHumanReadableDate(milliseconds: number) {
 /**
  * Backup all source data to output directory.
  */
-async function backupSourceFilesToOutputFolder(sourcePath: string) {
+async function backupSourceFilesToOutputFolder({
+  sourcePath,
+  outputPath,
+}: {
+  sourcePath: string;
+  outputPath: string;
+}) {
   copyFolderSync(
     path.join(sourcePath, essayFolderName),
     path.join(outputPath, essayFolderName)
@@ -99,15 +102,21 @@ async function backupSourceFilesToOutputFolder(sourcePath: string) {
  * - Download OCR result files from GCS to local data directory.
  * - Delete all uploaded and result files from GCS.
  */
-async function googleOcr(sourcePath: string) {
+async function googleOcr({
+  outputPath,
+  uid,
+}: {
+  outputPath: string;
+  uid: string;
+}) {
   const storage = new Storage({ keyFilename: serviceAccountJsonPath });
   const document = new DocumentProcessorServiceClient({
     keyFilename: serviceAccountJsonPath,
   });
 
   // Get all source data files from local directory.
-  const essayFileNames = fs.readdirSync(path.join(sourcePath, essayFolderName));
-  const formFileNames = fs.readdirSync(path.join(sourcePath, formFolderName));
+  const essayFileNames = fs.readdirSync(path.join(outputPath, essayFolderName));
+  const formFileNames = fs.readdirSync(path.join(outputPath, formFolderName));
 
   // Upload all source files to GCS.
   const bucketName = 'vision-ocr-source';
@@ -115,7 +124,7 @@ async function googleOcr(sourcePath: string) {
   const gcsOutputPrefix = 'output';
 
   async function upload(fileName: string, prefix: string) {
-    const sourceFilePath = path.join(sourcePath, prefix, fileName);
+    const sourceFilePath = path.join(outputPath, prefix, fileName);
     const destination = `${uid}/${gcsInputPrefix}/${prefix}/${fileName}`;
 
     await storage.bucket(bucketName).upload(sourceFilePath, {
@@ -152,9 +161,7 @@ async function googleOcr(sourcePath: string) {
           documents: fileNames.map((fileName) => {
             return {
               gcsUri: `gs://${bucketName}/${uid}/${gcsInputPrefix}/${prefix}/${fileName}`,
-              mimeType: fileName.toLowerCase().endsWith('pdf')
-                ? 'application/pdf'
-                : 'image/tiff',
+              mimeType: lookup(fileName).toString(),
             };
           }),
         },
@@ -219,7 +226,13 @@ function removeFileExtension(fileName: string) {
  * Essay will be written out as .txt, and form will be written out as .json.
  * Read all essay and form ocr result then output them into a single directory to simplify langchain document loading.
  */
-function generateSlimOcrResult(alwaysTxt = true) {
+function generateSlimOcrResult({
+  alwaysTxt = true,
+  outputPath,
+}: {
+  alwaysTxt?: boolean;
+  outputPath: string;
+}) {
   function generate(type: 'essay' | 'form', prefix: string) {
     const baseInputPath = path.join(outputPath, rawOcrOutputFolderName, prefix);
     const baseOutputPath = path.join(outputPath, langchainInputFolderName);
@@ -352,12 +365,6 @@ function generateSlimOcrResult(alwaysTxt = true) {
 }
 
 /**
- * Summarize each slimed essay using GPT to reduce file size and potentially increase embedding performance.
- * Replaces all the essay files with the summarized version that will be used as input for langchain for extraction.
- */
-async function summarizeAllSlimEssay() {}
-
-/**
  * Do not use embedding since bank statement etc embedding had a hard time retrieving the correct value.
  * Ask gpt one document at a time, then merge the result at the end.
  * One document at a time should be able to fit into gpt3.5 token limit.
@@ -366,7 +373,11 @@ async function summarizeAllSlimEssay() {}
  * https://js.langchain.com/docs/modules/chains/popular/structured_output
  * https://gist.github.com/horosin/5351ae4dc3eebbf181f9db212f5d3ebc
  */
-async function extractFieldsFromOcrResult() {
+async function extractFieldsFromOcrResult({
+  outputPath,
+}: {
+  outputPath: string;
+}) {
   const basePath = path.join(outputPath, langchainInputFolderName);
   const inputFiles = fs.readdirSync(basePath);
 
@@ -579,17 +590,33 @@ async function extractFieldsFromOcrResult() {
 
 async function runPythonLlamaLangchain() {}
 
-async function fillInTemplate() {}
+/**
+ * Read from template files, extract all template fields to be filled, then fill in the fields using langchain output.
+ * Fields can be identified by {{field_name}}
+ * For table, it will be {{[]|field_name1|field_name2|field_name3}}, and each matched
+ */
+async function fillInTemplate({ outputPath }: { outputPath: string }) {}
 
-async function run(directoryPath: string) {
-  await backupSourceFilesToOutputFolder(directoryPath);
-  await googleOcr(directoryPath);
-  generateSlimOcrResult();
-  await summarizeAllSlimEssay();
-  await extractFieldsFromOcrResult();
+function setupNewRun() {
+  const uid = '20230908_125219'; // generateHumanReadableDate(Date.now());
+  const outputPath = path.join(rootPath, 'output', uid);
+
+  // Create a new output directory for this run.
+  fs.mkdirSync(outputPath, { recursive: true });
+
+  console.log(`New run: ${uid} at ${outputPath}`);
+
+  return { uid, outputPath };
 }
-run(inputPath);
 
-// generateSlimOcrResult();
+export async function run() {
+  const sourcePath = path.join(rootPath, 'source');
+  console.log(`Loading source data from ${sourcePath}`);
 
-// extractFieldsFromOcrResult();
+  const { uid, outputPath } = setupNewRun();
+  await backupSourceFilesToOutputFolder({ sourcePath, outputPath });
+  await googleOcr({ outputPath, uid });
+  generateSlimOcrResult({ outputPath });
+  await extractFieldsFromOcrResult({ outputPath });
+  await fillInTemplate({ outputPath });
+}
