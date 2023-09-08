@@ -714,10 +714,10 @@ export function startServer() {
     const body = req.body as {
       essay: { name: string; content: string };
       form: { name: string; content: string };
-      template: { name: string; content: string };
+      templates: { name: string; content: string }[];
     };
 
-    const { essay, form, template } = body;
+    const { essay, form, templates } = body;
     const { uid, outputPath } = setupNewRun();
 
     function saveBase64StringToFile(outputFilePath: string, content: string) {
@@ -726,8 +726,8 @@ export function startServer() {
       console.log(`Saved frontend provided file to ${outputFilePath}`);
     }
 
-    if (!template) {
-      throw new Error('Template is required');
+    if (!templates) {
+      throw new Error('"templates" is required');
     }
 
     if (!essay && !form) {
@@ -748,10 +748,12 @@ export function startServer() {
       );
     }
 
-    saveBase64StringToFile(
-      path.join(outputPath, templateFolderName, template.name),
-      template.content
-    );
+    templates.forEach((template) => {
+      saveBase64StringToFile(
+        path.join(outputPath, templateFolderName, template.name),
+        template.content
+      );
+    });
 
     await googleOcr({ outputPath, uid });
     generateSlimOcrResult({ outputPath });

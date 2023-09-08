@@ -7,14 +7,14 @@ import TemplateUploader from './TemplateUploader'; // Import the TemplateUploade
 const Home: React.FC = () => {
   const [summaries, setSummaries] = useState<string[]>([]);
   const [pdf, setPdf] = useState<File | null>(null);
-  const [template, setTemplate] = useState<File | null>(null);
+  const [template, setTemplate] = useState<File[] | null>(null);
   const [processing, setProcessing] = useState(false);
 
   const handlePdfUpload = (files: FileList) => {
     setPdf(files[0]);
   };
   const handleTemplateUpload = (files: FileList) => {
-    setTemplate(files[0]);
+    setTemplate(Array.from(files));
   };
 
   const handleExtract = (extractedSummaries: string[]) => {
@@ -47,9 +47,9 @@ const Home: React.FC = () => {
     try {
       setProcessing(true);
 
-      const [pdfContent, templateContent] = await Promise.all([
+      const [pdfContent, templateContents] = await Promise.all([
         processFile(pdf),
-        processFile(template),
+        Promise.all(template.map((file) => processFile(file))),
       ]);
 
       const response = await fetch('http://localhost:8888/run', {
@@ -57,7 +57,10 @@ const Home: React.FC = () => {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ essay: pdfContent, template: templateContent }),
+        body: JSON.stringify({
+          essay: pdfContent,
+          templates: templateContents,
+        }),
       });
 
       // Trigger file download from local data.

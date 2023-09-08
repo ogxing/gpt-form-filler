@@ -34,6 +34,7 @@ const TemplateUploader: React.FC<TemplateUploaderProps> = ({ onUpload }) => {
                 name="template-upload"
                 type="file"
                 accept=".docx"
+                multiple
                 onChange={handleFileChange}
                 className="sr-only"
               />
