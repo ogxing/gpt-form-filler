@@ -589,7 +589,10 @@ async function extractFieldsFromOcrResult({
 
   // Ask GPT again to merge all individual result into a single json.
   const chain = createExtractionChainFromZod(zodSchema, model);
-  const mergedResponse = await chain.run(JSON.stringify(responses));
+  const mergedResponse =
+    responses.length > 1
+      ? await chain.run(JSON.stringify(responses))
+      : responses[0];
 
   const mergedOutputPath = path.join(outputPath, langchainMergedOutputFileName);
   fs.writeFileSync(mergedOutputPath, JSON.stringify(mergedResponse, null, 2));
