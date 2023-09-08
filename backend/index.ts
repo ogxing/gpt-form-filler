@@ -1,4 +1,3 @@
-import { ImageAnnotatorClient } from '@google-cloud/vision';
 import { Storage } from '@google-cloud/storage';
 import { DocumentProcessorServiceClient } from '@google-cloud/documentai';
 import { z } from 'zod';
@@ -16,7 +15,7 @@ import fs from 'fs';
 import path, { dirname } from 'path';
 import { fileURLToPath } from 'url';
 import * as PizZip from 'pizzip';
-import * as DocxTemplater from 'docxtemplater';
+import * as Docxtemplater from 'docxtemplater';
 import { lookup } from 'mime-types';
 
 // Replace with your own API key.
@@ -31,10 +30,12 @@ const formProcessorId = 'b6fc1624054856a2';
 const essayFolderName = 'essays';
 const formFolderName = 'forms';
 const templateFolderName = 'templates';
+const filledTemplateFolderName = 'docx';
 const rawOcrOutputFolderName = 'ocr';
 const langchainInputFolderName = 'slim';
 const langchainIndividualOutputFileName = 'langchain-each.json';
 const langchainMergedOutputFileName = 'langchain.json';
+const defaultSourceDataFolder = 'source';
 
 const rootPath = path.join(fileURLToPath(dirname(import.meta.url)), '..');
 
@@ -429,6 +430,10 @@ async function extractFieldsFromOcrResult({
       .string()
       .optional()
       .describe('Identity card number of the deceased'),
+    place_of_death: z
+      .string()
+      .optional()
+      .describe('Place of death of the deceased'),
     date_of_death: z
       .string()
       .optional()
@@ -595,7 +600,73 @@ async function runPythonLlamaLangchain() {}
  * Fields can be identified by {{field_name}}
  * For table, it will be {{[]|field_name1|field_name2|field_name3}}, and each matched
  */
-async function fillInTemplate({ outputPath }: { outputPath: string }) {}
+async function fillInTemplate({ outputPath }: { outputPath: string }) {
+  const langchainOutputPath = path.join(
+    outputPath,
+    langchainMergedOutputFileName
+  );
+  const langchainOutput = JSON.parse(
+    fs.readFileSync(langchainOutputPath, 'utf-8')
+  );
+
+  // Fill in all empty fields with their field name.
+  Object.keys(langchainOutput).forEach((key) => {
+    if (langchainOutput[key] === '') {
+      langchainOutput[key] = key;
+    }
+  });
+
+  console.log(`Generating template using source data ${langchainOutputPath}`);
+
+  fs.mkdirSync(path.join(outputPath, filledTemplateFolderName), {
+    recursive: true,
+  });
+
+  function generateDocx(fileName: string) {
+    const fullTemplatePath = path.join(
+      outputPath,
+      templateFolderName,
+      fileName
+    );
+
+    console.log(`Filling template for ${fullTemplatePath}`);
+
+    // https://docxtemplater.com/docs/get-started-node/
+    const content = fs.readFileSync(fullTemplatePath, 'binary');
+
+    const zip = new PizZip.default(content);
+
+    const doc = new Docxtemplater.default(zip, {
+      paragraphLoop: true,
+      linebreaks: true,
+    });
+
+    doc.render(langchainOutput);
+
+    const buf = doc.getZip().generate({
+      type: 'nodebuffer',
+      compression: 'DEFLATE',
+    });
+
+    const filledTemplateOutputPath = path.join(
+      outputPath,
+      filledTemplateFolderName,
+      removeFileExtension(fileName) + '.docx'
+    );
+
+    fs.writeFileSync(filledTemplateOutputPath, buf);
+
+    console.log(`Filled template saved to ${filledTemplateOutputPath}`);
+  }
+
+  const templateFileNames = fs.readdirSync(
+    path.join(outputPath, templateFolderName)
+  );
+
+  for (const templateFileName of templateFileNames) {
+    generateDocx(templateFileName);
+  }
+}
 
 function setupNewRun() {
   const uid = '20230908_125219'; // generateHumanReadableDate(Date.now());
@@ -610,10 +681,11 @@ function setupNewRun() {
 }
 
 export async function run() {
-  const sourcePath = path.join(rootPath, 'source');
+  const { uid, outputPath } = setupNewRun();
+
+  const sourcePath = path.join(rootPath, defaultSourceDataFolder);
   console.log(`Loading source data from ${sourcePath}`);
 
-  const { uid, outputPath } = setupNewRun();
   await backupSourceFilesToOutputFolder({ sourcePath, outputPath });
   await googleOcr({ outputPath, uid });
   generateSlimOcrResult({ outputPath });

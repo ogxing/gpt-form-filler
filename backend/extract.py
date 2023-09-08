@@ -45,6 +45,7 @@ index.storage_context.persist()
 #         <string name="maritial_status" description="Maritial status of the deceased" format="one-line" on-fail-one-line="noop" />
 #         <string name="occupation" description="Occupation of the deceased" format="one-line" on-fail-one-line="noop" />
 #         <string name="identity_card" description="Identity card number of the deceased" format="one-line" on-fail-one-line="noop" />
+#         <string name="place_of_death" description="Place of death of the deceased" format="one-line" on-fail-one-line="noop" />
 #         <string name="date_of_death" description="Date of death of the deceased" format="one-line" on-fail-one-line="noop" />
 #         <string name="will_written_at" description="Date of will written" format="one-line" on-fail-one-line="noop" />
 #         <string name="domicile" description="Domicile of the deceased" format="one-line" on-fail-one-line="noop" />
@@ -122,6 +123,7 @@ response_schemas = [
     ResponseSchema(name="maritial_status", description="Maritial status of the deceased"),
     ResponseSchema(name="occupation", description="Occupation of the deceased"),
     ResponseSchema(name="identity_card", description="Identity card number of the deceased"),
+    ResponseSchema(name="place_of_death", description="Place of death of the deceased"),
     ResponseSchema(name="date_of_death", description="Date of death of the deceased"),
     ResponseSchema(name="will_written_at", description="Date of will written"),
     ResponseSchema(name="domicile", description="Domicile of the deceased"),
